@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "bnbu-ispace-mcp"
+name = "bnbu-portal-mcp"
 version = "0.1.0"
 description = "MCP server + CLI for BNBU iSpace (Moodle): courses, assignments, deadlines, files; write tools locked by default"
 readme = "README.md"
@@ -29,23 +29,21 @@ dependencies = [
   "mcp>=1.9,<2",
   "httpx>=0.25",
   "keyring>=24",
-  "platformdirs>=3",
-  "tzdata",
 ]
 
 [project.optional-dependencies]
 test = ["pytest>=7"]
 
 [project.urls]
-Homepage = "https://github.com/genshinkleenahida/bnbu-ispace-mcp"
-Repository = "https://github.com/genshinkleenahida/bnbu-ispace-mcp"
-Issues = "https://github.com/genshinkleenahida/bnbu-ispace-mcp/issues"
+Homepage = "https://github.com/genshinkleenahida/bnbu-portal-mcp"
+Repository = "https://github.com/genshinkleenahida/bnbu-portal-mcp"
+Issues = "https://github.com/genshinkleenahida/bnbu-portal-mcp/issues"
 
 [project.scripts]
-ispace-mcp = "ispace_mcp.cli:main"
+portal-mcp = "portal_mcp.cli:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/ispace_mcp"]
+packages = ["src/portal_mcp"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

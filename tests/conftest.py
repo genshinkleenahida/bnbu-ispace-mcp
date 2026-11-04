@@ -1,139 +1,131 @@
-"""Local mock Moodle server (token.php, REST, upload.php, pluginfile) for offline tests."""
+"""One local mock server standing in for iSpace (Moodle), BNBU SSO and MIS. No network, no real accounts."""
 import json
+import re
+import secrets
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 import pytest
 
-GOOD_TOKEN = "tok_good_1234567890abcdef"
-NOW = 1_800_000_000
+from portal_mcp import sm2
+
+PW, TOKEN, NOW = "pw-secret-xyz", "tok_good_123456", int(time.time())
+PRIV = secrets.randbelow(sm2.N - 1) + 1
+PUB = sm2._mul(PRIV, sm2.G)
+PUB_HEX = PUB[0].to_bytes(32, "big").hex() + PUB[1].to_bytes(32, "big").hex()
+SEC_A, SEC_B = "a" * 32, "b" * 32
+LOG = {"calls": [], "submitted": [], "saved": []}  # reset per test
 
 
-class State:
-    def __init__(self):
-        self.reset()
-
-    def reset(self):
-        self.password = "pw-secret-xyz"
-        self.token_requests = 0
-        self.rest_calls = []
-        self.reject_next_token_use = False
-        self.disabled = None  # None | "ws" | "service"
-        self.uploaded = []
-        self.submitted = []
+def decrypt(h: str) -> str:
+    raw = bytes.fromhex(h)[1:]
+    c1, c3, c2 = (int.from_bytes(raw[:32], "big"), int.from_bytes(raw[32:64], "big")), raw[64:96], raw[96:]
+    x, y = (v.to_bytes(32, "big") for v in sm2._mul(PRIV, c1))
+    return bytes(a ^ b for a, b in zip(c2, sm2._kdf(x + y, len(c2)))).decode()
 
 
-STATE = State()
-ASSIGN_DUE = 2_000_000_000
-
-
-def _rest(fn, p):
-    if fn == "core_webservice_get_site_info":
-        return {"sitename": "Mock Moodle", "username": "u4000", "fullname": "Test Student", "userid": 7,
-                "release": "4.1", "lang": "en", "siteurl": "x", "usercanmanageownfiles": True,
-                "functions": [{"name": "core_webservice_get_site_info"}, {"name": "mod_assign_get_assignments"}]}
-    if fn == "core_enrol_get_users_courses":
-        return [{"id": 11, "shortname": "C1", "fullname": "Course One", "progress": 10, "completed": False,
-                 "startdate": NOW, "enddate": 0, "lastaccess": NOW}]
-    if fn == "core_course_get_contents":
-        return [{"id": 1, "name": "General", "summary": "", "modules": [
-            {"id": 5, "instance": 1, "name": "Slides", "modname": "resource", "url": "u", "visible": 1,
-             "description": "", "contents": [{"type": "file", "filename": "slides.txt", "filesize": 5,
-                                              "mimetype": "text/plain", "timemodified": NOW,
-                                              "fileurl": "{base}/pluginfile.php/1/mod_resource/content/1/slides.txt"}]}]}]
-    if fn == "mod_assign_get_assignments":
-        return {"courses": [{"id": 11, "fullname": "Course One", "assignments": [
-            {"id": 99, "cmid": 5, "name": "Essay", "duedate": ASSIGN_DUE, "cutoffdate": 0,
-             "allowsubmissionsfromdate": 0, "grade": 100, "intro": "", "introattachments": []}]}]}
-    if fn == "mod_assign_get_submission_status":
-        return {"lastattempt": {"submission": {"status": "new", "attemptnumber": 0, "timemodified": 0,
-                                                "plugins": []}, "canedit": True, "cansubmit": False,
-                                "locked": False}}
-    if fn == "mod_assign_save_submission":
-        STATE.uploaded.append(p)
+def moodle(fn: str, p: dict):
+    ws = {
+        "core_webservice_get_site_info": {"fullname": "Test Student", "userid": 7, "username": "u1", "sitename": "S",
+                                          "functions": [{"name": "core_webservice_get_site_info"}]},
+        "core_enrol_get_users_courses": [{"id": 11, "shortname": "C1", "fullname": "Course One", "progress": 1}],
+        "core_course_get_contents": [{"id": 1, "name": "General", "summary": "", "modules": []}],
+        "mod_assign_get_assignments": {"courses": [{"id": 11, "fullname": "Course One", "assignments": [
+            {"id": 99, "name": "Essay", "duedate": 2_000_000_000, "intro": "", "introattachments": []}]}]},
+        "mod_assign_get_submission_status": {"lastattempt": {"submission": {"status": "new", "plugins": []}}},
+        "mod_forum_get_forums_by_courses": [{"id": 31, "course": 11, "name": "Announcements"}],
+        "mod_forum_get_forum_discussions": {"discussions": [{"id": 501, "discussion": 41, "name": "Midterm notice",
+            "created": NOW - 3600, "userfullname": "Dr. T", "numreplies": 0, "message": "<p>Midterm on <b>6 Nov</b>, 16:00</p>"}]},
+        "mod_label_get_labels_by_courses": {"labels": [{"id": 71, "course": 11, "name": "Final", "visible": 1,
+            "timemodified": NOW - 7200, "intro": "<p>期末考试在12月</p>"}]},
+        "mod_page_get_pages_by_courses": {"pages": []},
+        "core_message_get_messages": {"messages": [{"id": 9, "subject": "Hi", "fullmessage": "no keywords here",
+            "timecreated": NOW - 500, "userfromfullname": "X"}] if p.get("type") == "notifications" and p.get("read") == "0" else []},
+    }
+    if fn in ("mod_assign_save_submission", "mod_assign_submit_for_grading"):
+        LOG["saved"].append(fn)
         return []
-    if fn == "mod_assign_submit_for_grading":
-        STATE.submitted.append(p)
-        return []
-    return {"exception": "webservice_access_exception", "errorcode": "accessexception", "message": "no such fn"}
+    return ws.get(fn, {"exception": "x", "errorcode": "accessexception", "message": "no such fn"})
+
+
+def question(sec):
+    radios = lambda n, labs: "".join(f'<label><input type="radio" name="{n}" value="{n}{len(labs) - i}">{l}</label>'
+                                     for i, l in enumerate(labs))
+    return ('<div class="te_info_title_a">Course/Section : Compilers (Dr. X)</div>'
+            '<div class="te_part_title">Teaching is good</div>' + radios("q1", ["Strongly Disagree", "Neutral", "Strongly Agree"]) +
+            '<div class="te_part_title">Overall</div>' + radios("q2", ["Poor", "Good", "Very good"]) +
+            '<div class="te_part_title">Comments (optional)</div><textarea name="txt"></textarea>')
 
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
-    def _send(self, obj, code=200, ctype="application/json", raw=None):
-        body = raw if raw is not None else json.dumps(obj).encode()
-        self.send_response(code)
+    def reply(self, body, ctype="application/json"):
+        raw = body if isinstance(body, bytes) else (body if isinstance(body, str) else json.dumps(body)).encode()
+        self.send_response(200)
         self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Content-Length", str(len(raw)))
         self.end_headers()
-        self.wfile.write(body)
-
-    def _form(self):
-        n = int(self.headers.get("Content-Length", 0))
-        raw = self.rfile.read(n)
-        if "multipart" in self.headers.get("Content-Type", ""):
-            return {}, raw
-        return {k: v[0] for k, v in parse_qs(raw.decode()).items()}, raw
+        self.wfile.write(raw)
 
     def do_POST(self):
-        path = urlparse(self.path).path
-        base = f"http://127.0.0.1:{self.server.server_port}"
-        p, raw = self._form()
+        path, n = urlparse(self.path).path, int(self.headers.get("Content-Length", 0))
+        raw = self.rfile.read(n)
+        form = {k: v[0] for k, v in parse_qs(raw.decode(errors="ignore")).items()}
         if path == "/login/token.php":
-            STATE.token_requests += 1
-            if STATE.disabled == "ws":
-                return self._send({"error": "Web services must be enabled in Advanced features.",
-                                   "errorcode": "enablewsdescription"})
-            if STATE.disabled == "service":
-                return self._send({"error": "The requested service (moodle_mobile_app) is not available.",
-                                   "errorcode": "servicenotavailable"})
-            if p.get("password") != STATE.password:
-                return self._send({"error": "Invalid login, please try again", "errorcode": "invalidlogin"})
-            return self._send({"token": GOOD_TOKEN})
+            return self.reply({"token": TOKEN} if form.get("password") == PW else {"error": "Invalid login", "errorcode": "invalidlogin"})
         if path == "/webservice/rest/server.php":
-            STATE.rest_calls.append(p.get("wsfunction"))
-            if p.get("wstoken") != GOOD_TOKEN or STATE.reject_next_token_use:
-                STATE.reject_next_token_use = False
-                return self._send({"exception": "moodle_exception", "errorcode": "invalidtoken",
-                                   "message": "Invalid token - token not found"})
-            res = _rest(p.get("wsfunction"), p)
-            return self._send(json.loads(json.dumps(res).replace("{base}", base)))
-        if path == "/webservice/upload.php":
-            STATE.uploaded.append(("upload", len(raw)))
-            return self._send([{"itemid": 4242, "filename": "a.txt"}])
-        self._send({}, 404)
+            LOG["calls"].append(form.get("wsfunction"))
+            if form.get("wstoken") != TOKEN:
+                return self.reply({"exception": "x", "errorcode": "invalidtoken", "message": "bad token"})
+            return self.reply(moodle(form["wsfunction"], form))
+        if path == "/auth/pwd/tencent/login":
+            ok = decrypt(json.loads(raw)["password"]) == PW
+            return self.reply({"data": {"success": ok, "message": "" if ok else "bad password"}})
+        if path == "/mis/student/te/submit.do":
+            LOG["submitted"].append((parse_qs(urlparse(self.path).query)["sectionId"][0], form))
+            return self.reply("ok", "text/html")
+        self.send_error(404)
 
     def do_GET(self):
         u = urlparse(self.path)
-        if u.path.startswith("/pluginfile.php/"):
-            if parse_qs(u.query).get("token", [None])[0] != GOOD_TOKEN:
-                return self._send(None, ctype="application/json",
-                                  raw=b'{"exception":"moodle_exception","errorcode":"invalidtoken"}')
-            return self._send(None, ctype="text/plain", raw=b"hello")
-        self._send({}, 404)
+        pages = {
+            "/auth/flow/login/getSm2PubK": {"data": PUB_HEX},
+            "/auth/account/app/list": {"data": [{"url": "3bvkl8pks1ki04nirus0g", "displayName": "mis_2006", "accountNameList": ["u1"]}]},
+            "/mis/student/te/home.do": f'<table><tr><td id="{"5" * 32}">Teaching Evaluation 2026</td></tr></table>' if EVAL["open"] else "<p>none</p>",
+            "/mis/student/te/section.do": (
+                '<table><tr><th>1</th><td>Compilers (1003)</td><td>Dr. A</td><th><button onclick="location=\'question.do?sectionId=' + SEC_A +
+                '\'">Evaluate</button></th></tr><tr><th>2</th><td>Done (1001)</td><td>Dr. B</td><th><button disabled="disabled">Evaluated</button></th></tr></table>'),
+            "/mis/student/te/question.do": question(parse_qs(u.query).get("sectionId", [""])[0]),
+        }
+        if u.path.startswith("/auth/sso/login/"):
+            return self.reply("<html>ok</html>", "text/html")
+        self.reply(pages[u.path], "text/html" if u.path.startswith("/mis") else "application/json") if u.path in pages else self.send_error(404)
+
+
+EVAL = {"open": True}
 
 
 @pytest.fixture()
-def mock_site(tmp_path, monkeypatch):
+def site(tmp_path, monkeypatch):
     srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
-    STATE.reset()
-    base = f"http://127.0.0.1:{srv.server_port}"
-    for k in ("ISPACE_TOKEN", "ISPACE_ALLOW_WRITE", "ISPACE_TZ", "ISPACE_USERNAME", "ISPACE_PASSWORD"):
+    url = f"http://127.0.0.1:{srv.server_port}"
+    for k in ("ISPACE_TOKEN", "ISPACE_ALLOW_WRITE"):
         monkeypatch.delenv(k, raising=False)
-    monkeypatch.setenv("ISPACE_URL", base)
+    for k in ("ISPACE_URL", "ISPACE_SSO_URL", "ISPACE_MIS_URL", "ISPACE_OA_URL"):
+        monkeypatch.setenv(k, url)
     monkeypatch.setenv("ISPACE_CONFIG_DIR", str(tmp_path / "cfg"))
-    monkeypatch.setenv("ISPACE_TOKEN_FILE", str(tmp_path / "token"))
-    monkeypatch.setenv("ISPACE_USERNAME", "u4000")
-    monkeypatch.setenv("ISPACE_PASSWORD", STATE.password)
-    monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setenv("USERPROFILE", str(tmp_path))
-    import ispace_mcp.ops as ops
-    ops._client = None
-    yield base
-    ops._client = None
+    monkeypatch.setenv("ISPACE_USERNAME", "u1")
+    monkeypatch.setenv("ISPACE_PASSWORD", PW)
+    LOG.update(calls=[], submitted=[], saved=[])
+    EVAL["open"] = True
+    from portal_mcp import tools
+    tools._client = tools._portal = None
+    yield url
+    tools._client = tools._portal = None
     srv.shutdown()
     srv.server_close()
